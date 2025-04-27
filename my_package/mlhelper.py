@@ -7,7 +7,9 @@ import scipy.stats as stats
 from lightgbm import LGBMClassifier
 from matplotlib.animation import FuncAnimation
 import matplotlib.cm as cm
-from imblearn.over_sampling import SMOTE
+from imblearn.combine import SMOTEENN, SMOTETomek
+from imblearn.over_sampling import ADASYN, BorderlineSMOTE, KMeansSMOTE, RandomOverSampler, SMOTE
+from imblearn.under_sampling import ClusterCentroids, EditedNearestNeighbours, NearMiss, NeighbourhoodCleaningRule, RandomUnderSampler, TomekLinks
 from IPython.display import HTML
 from scipy.spatial.distance import mahalanobis
 from scipy.stats import chi2, kurtosis, shapiro, skew
@@ -21,7 +23,7 @@ from sklearn.manifold import TSNE
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import cross_val_score, learning_curve, train_test_split, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier, LocalOutlierFactor
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MaxAbsScaler, MinMaxScaler, PowerTransformer, RobustScaler, StandardScaler
 from sklearn.svm import SVC
 from umap import UMAP
 from xgboost import XGBClassifier
@@ -220,37 +222,46 @@ class MLHelper():
         
         return pd.DataFrame(X_umap_train), pd.DataFrame(X_umap_test) if should_return_fitted_data else None
     
-    def animte_data_3D(self, X: pd.DataFrame, y: pd.Series, extraction_method: str) -> HTML:
-        METHOD = {
+    def animte_data_3D(self, X: pd.DataFrame, y: pd.Series, method: str) -> HTML:
+        '''
+        - method
+            - PCA
+            - t-SNE
+            - UMAP
+        '''
+        METHODS = {
             'PCA': PCA(n_components=3),
             't-SNE': TSNE(n_components=3, random_state=42, n_jobs=-1),
             'UMAP': UMAP(n_components=3, n_jobs=-1)
         }
-        X_reduced = METHOD[extraction_method].fit_transform(X)
-        fig = plt.figure(figsize=(10, 7))
-        ax = fig.add_subplot(111, projection='3d')
-        for label, info in self.labels_dict.items():
-            target = X_reduced[y == label]
-            ax.scatter(target[:, 0], 
-                       target[:, 1], 
-                       target[:, 2],
-                       c=info.get('color'), 
-                       marker=info.get('marker'), 
-                       edgecolor='k',
-                       s=40, 
-                       label=info.get('name'))
-        ax.set_title("3D " + self.dataset_name + " Data " + extraction_method)
-        ax.set_xlabel("Component 1")
-        ax.set_ylabel("Component 2")
-        ax.set_zlabel("Component 3")
-        plt.legend([info.get('name') for info in self.labels_dict.values()])
+        if extraction_method := METHODS.get(method):
+            X_reduced = extraction_method.fit_transform(X)
+            fig = plt.figure(figsize=(10, 7))
+            ax = fig.add_subplot(111, projection='3d')
+            for label, info in self.labels_dict.items():
+                target = X_reduced[y == label]
+                ax.scatter(target[:, 0], 
+                        target[:, 1], 
+                        target[:, 2],
+                        c=info.get('color'), 
+                        marker=info.get('marker'), 
+                        edgecolor='k',
+                        s=40, 
+                        label=info.get('name'))
+            ax.set_title("3D " + self.dataset_name + " Data " + method)
+            ax.set_xlabel("Component 1")
+            ax.set_ylabel("Component 2")
+            ax.set_zlabel("Component 3")
+            plt.legend([info.get('name') for info in self.labels_dict.values()])
 
-        def rotate(angle):
-            ax.view_init(elev=30, azim=angle)
+            def rotate(angle):
+                ax.view_init(elev=30, azim=angle)
 
-        ani = FuncAnimation(fig, rotate, frames=range(0, 360, 2), interval=50)
-        plt.close(fig)  # prevent static plot
-        return HTML(ani.to_jshtml())
+            ani = FuncAnimation(fig, rotate, frames=range(0, 360, 2), interval=50)
+            plt.close(fig)  # prevent static plot
+            return HTML(ani.to_jshtml())
+        else:
+            print(method, 'is not a valid plotting method')
     
     def get_transformed_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df_copy = df.copy()
@@ -271,9 +282,40 @@ class MLHelper():
                         X_test: pd.DataFrame,
                         y_train: pd.Series,
                         y_test: pd.Series,
-                        scaler: str):
+                        scaler: str,
+                        params=None):
+        '''
+        - mas: MaxAbsScaler
+            - range becomes -1 to 1
+            - not sensitive to outliers
+            - data does not have to follow Gaussian distribution
+            - use when data is centered around 0
+        - mm: MinMaxScaler
+            - range becomes 0 to 1
+            - sensitive to outliers
+            - use when using models sensitive to scale (linear, distance, gradient descent based models)
+        - pt: PowerTransformer
+            - params
+                - method: ["yeo-johnson", "box-cox"]]
+            - scales data and make it follow Gaussian distribution
+            - mean becomes 0
+            - standard deviation becomes 1
+            - use when data is skewed
+        - rs: RobustScaler
+            - range becomes IQR (25th and 75th) centered at median
+            - even less sensitive to outliers
+            - no assumption about data distribution
+            - use when data has significant outliers or is skewed
+        - ss: StandardScaler
+            - range becomes -1 to 1
+            - less sensitive to outliers
+            - use when data follows Gaussian distribution
+        '''
         scalers = {
+            'mas': MaxAbsScaler(),
             'mm': MinMaxScaler(),
+            'pt': PowerTransformer(**params),
+            'rb': RobustScaler(),
             'ss': StandardScaler()
         }
         if scaler := scalers.get(scaler):
@@ -285,10 +327,6 @@ class MLHelper():
             return None
 
     def _get_outlier_dbscan(self, df: pd.DataFrame, params) -> pd.Index:
-        '''
-        Feature Transformation recommended
-        Feature Scaling recommended
-        '''
         dbscan = DBSCAN(**params)
         labels = dbscan.fit_predict(df)
         return df[labels == -1].index
@@ -313,19 +351,11 @@ class MLHelper():
         return np.unique(np.array(outliers))
 
     def _get_outlier_local_outlier_factor(self, df: pd.DataFrame, params) -> pd.Index:
-        '''
-        Feature Transformation recommended
-        Feature Scaling recommended
-        '''
         lof = LocalOutlierFactor(**params)
         y_pred = lof.fit_predict(df)  # -1 for outliers, 1 for inliers
         return df[y_pred == -1].index
 
     def _get_outlier_mahalanobis(self, df: pd.DataFrame, params) -> pd.Index:
-        '''
-        Feature Transformation recommended
-        Feature Scaling recommended
-        '''
         mean_vec = np.mean(df, axis=0)
         cov_matrix = np.cov(df, rowvar=False)
         inv_cov_matrix = np.linalg.inv(cov_matrix)
@@ -337,6 +367,54 @@ class MLHelper():
                         df: pd.DataFrame, 
                         method: str, 
                         params):
+        '''
+        - method
+            - dbscan
+                - use when 
+                    - data has clusters of varying shapes and densities and want to detect outliers that do not belong to any cluster
+                    - data doesn't follow Gaussian distribution
+                - dont use when 
+                    - data is uniformly distributed
+                    - clusters are similar sizes
+                - feature transformation recommended
+                - feature scaling recommended
+            - if
+                - use when 
+                    - data is large and high-dimensional
+                    - data contains outliers that are distinct and separate
+                    - data is large
+                - dont use when
+                    - data is small
+                    - data has few outliers
+            - iqr
+                - use when
+                    - data is concentrated within a known range
+                    - data is univariate (single feature)
+                - dont use when
+                    - data contains many extreme values
+                    - data is skewed
+                    - data is multi-dimensional
+            - loc
+                - use when 
+                    - data is high-dimensional
+                    - data is heterogeneous
+                        - has both discrete and continuous data
+                        - features have different statistical properties (distribution, etc)
+                        - features have varying relationships
+                - dont use when
+                    - data has large, uniform regions without much local density variation
+                - feature transformation recommended
+                - feature scaling recommended
+            - m
+                - use when
+                    - data is multivariate (multi-feature)
+                    - data follows Gaussian distribution
+                - dont use when
+                    - data is not multivariate
+                    - data does not follow Gaussian distribution
+                - feature transformation recommended
+                - feature scaling recommended
+        '''
         METHODS = {
             'dbscan': self._get_outlier_dbscan,
             'if': self._get_outlier_isolation_forest,
@@ -344,15 +422,80 @@ class MLHelper():
             'loc': self._get_outlier_local_outlier_factor,
             'm': self._get_outlier_mahalanobis
         }
-        if outlier_method := METHODS[method]:
+        if outlier_method := METHODS.get(method):
             return df.drop(outlier_method(df, params), axis=0, inplace=False)
         elif method:
             print(method, 'is not a valid outlier method')
             return None
         
-    # TODO
-    def oversample():
-        pass
+    def undersample(self, 
+                    X_train: pd.DataFrame,
+                    y_train: pd.Series,
+                    method: str) -> list[np.ndarray]:
+        '''
+        - method
+            - cc: ClusterCentroids
+                - when majority class forms a discernable shape other than a big clump
+            - enn: EditedNearestNeighbours
+                - when majority class has many outliers
+            - nm: NearMiss
+                - when minority class is heavily surrounded
+            - ncr: NeighbourhoodCleaningRule
+                - when majority forms a giant blob and minority is embedded inside
+            - rus: RandomUnderSampler
+                - when majority is large with no clear structure
+            - tl: TomekLinks
+                - when majority and minority classes strongly overlap and decision boundery is fuzzy
+        '''
+        METHODS = {
+            'cc': ClusterCentroids(random_state=42),
+            'enn': EditedNearestNeighbours(n_jobs=-1),
+            'nm': NearMiss(n_jobs=-1),
+            'ncr': NeighbourhoodCleaningRule(n_jobs=-1),
+            'rus': RandomUnderSampler(random_state=42),
+            'tl': TomekLinks(n_jobs=-1),
+        }
+        if undersample_method := METHODS.get(method):
+            return undersample_method.fit_resample(X_train, y_train)
+        elif method:
+            print(method, 'is not a valid undersampling method')
+            return None
+        
+    def oversample(self, 
+                   X_train: pd.DataFrame,
+                   y_train: pd.Series,
+                   method: str) -> list[np.ndarray]:
+        '''
+        - method
+            - a: ADASYN
+                - when minority class is fully surrounded and tightly clumped
+            - bs: BorderlineSMOTE
+                - when minority class is fully surrounded and tightly clumped
+            - kms: KMeansSMOTE
+                - when minority class is made of multiple tiny groups
+            - ros: RandomOverSampler
+                - when classes are separable
+            - s: SMOTE
+                - when all else fails
+            - se: SMOTEENN
+                - when minority class is scattered everywhere (noisy)
+            - st: SMOTETomek
+                - when minority class are close to the decision boundary (overlapping)
+        '''
+        METHODS = {
+            'a': ADASYN(random_state=42),
+            'bs': BorderlineSMOTE(random_state=42),
+            'kms': KMeansSMOTE(random_state=42),
+            'ros': RandomOverSampler(random_state=42),
+            's': SMOTE(random_state=42),
+            'se': SMOTEENN(random_state=42),
+            'st': SMOTETomek(random_state=42)
+        }
+        if oversample_method := METHODS.get(method):
+            return oversample_method.fit_resample(X_train, y_train)
+        elif method:
+            print(method, 'is not a valid oversampling method')
+            return None
             
     def extract_features(self, 
                          X_train: pd.DataFrame, 
@@ -361,12 +504,18 @@ class MLHelper():
                          y_test: pd.Series, 
                          method: str, 
                          params) -> list[pd.DataFrame]:
+        '''
+        - method
+            - lda
+            - pca
+            - umap
+        '''
         METHODS = {
             'lda': self.extract_features_lda,
             'pca': self.extract_features_pca,
             'umap': self.extract_features_umap
         }
-        if extraction_method := METHODS[method]:
+        if extraction_method := METHODS.get(method):
             return extraction_method(X_train, X_test, y_train, y_test, params, True)
         elif method:
             print(method, 'is not a valid feature extraction method')
@@ -598,6 +747,68 @@ class MLHelper():
                                  y_test: pd.Series,
                                  should_randomize: bool=False,
                                  trials: int=100):
+        '''
+        - model
+            - knn: KNeighborsClassifier
+                - use when
+                    - data's decision boundary is irregular and non-linear
+                    - data is small to medium sized datasets 
+                    - data has localized patterns
+                - examples
+                    - image classification
+                    - geospacial data
+                    - anomaly detection
+            - lgbm: LGBMClassifier
+                - use when 
+                    - data is large
+                    - data is structured (rows and columns)
+                    - data is imbalanced
+                    - data is high-dimensional
+                    - features have varying relationships
+                = examples
+                    - custumer churn prediction
+                    - fraud detection
+                    - risk prediction
+            - lr: LogisticRegression
+                - use when
+                    - binary classification
+                    - data is low-dimensional
+                    - data's decision boundary is linear
+                - examples
+                    - spam detection
+                    - medical diagnosis
+                    - customer binary clustering
+            - rf: RandomForestClassifier
+                - use when
+                    - data is imbalanced
+                    - data is high-dimensional
+                    - discrete and continuous features have varying relationships
+                    - data's decision boundary is non-linear
+                - examples
+                    - customer clustering
+                    - credit scoring
+                    - feature importance anlysis
+            - svc: SVC
+                - use when
+                    - data is high-dimensional and non-linear
+                    - data has outliers that can't be removed
+                - examples
+                    - text classification
+                    - image classification
+                    - biological data
+            - xgb: XGBClassifier
+                - use when
+                    - data is large and high-dimensional
+                    - data is imbalanced
+                    - data has null values
+                    - features have varying relationships
+                    - discrete and continuous features interact in non-linear ways (think discrete on x axis and continuous on y)
+                - examples
+                    - predicting load defaults
+                    - fraud detection
+                    - product recommendation
+                    - predicting disease progression
+        '''
         params = self._get_optimized_params(model, X_train, y_train, should_randomize, trials)
         clf = self._get_model(model, params)
         self._plot_learning_curve(clone(clf), X_train, y_train)
