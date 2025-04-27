@@ -424,7 +424,7 @@ class MLHelper():
                     C = trial.suggest_float('C', 1e-4, 1e2)
                     solver = 'liblinear' if penalty == 'l1' else trial.suggest_categorical('solver', ['lbfgs', 'saga', 'liblinear'])
                     max_iter = trial.suggest_int('max_iter', 100, 10000)
-                    clf = LogisticRegression( penalty=penalty, C=C,  solver=solver, max_iter=max_iter, random_state=42, n_jobs=-1)
+                    clf = LogisticRegression(penalty=penalty, C=C,  solver=solver, max_iter=max_iter, random_state=42, n_jobs=-1)
                 case 'rf':
                     params = {
                         'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
@@ -435,12 +435,12 @@ class MLHelper():
                     clf = RandomForestClassifier(**params, random_state=random_seed, n_jobs=-1
                     )
                 case 'svc':
-                    C = trial.suggest_loguniform('C', 0.001, 100)
+                    C = trial.suggest_float('C', 0.001, 100, log=True)
                     kernel = trial.suggest_categorical('kernel', ['linear', 'rbf', 'poly', 'sigmoid'])
-                    gamma = trial.suggest_loguniform('gamma', 0.0001, 10) if kernel != 'linear' else 'auto'
+                    gamma = trial.suggest_float('gamma', 0.0001, 10, log=True) if kernel != 'linear' else 'auto'
                     degree = trial.suggest_int('degree', 2, 5) if kernel == 'poly' else 3
                     max_iter = trial.suggest_int('max_iter', 100, 10000)
-                    clf = SVC(C=C, kernel=kernel, gamma=gamma, degree=degree, max_iter=max_iter, random_state=random_seed)
+                    clf = SVC(C=C, kernel=kernel, gamma=gamma, degree=degree, max_iter=max_iter, probability=True, random_state=random_seed)
                 case 'xgb':
                     params = {
                         'n_estimators': trial.suggest_int('n_estimators', 100, 10000),
@@ -451,7 +451,6 @@ class MLHelper():
                         'gamma': trial.suggest_float('gamma', 0, 5),
                         'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 1.0, log=True),
                         'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 1.0, log=True),
-                        'use_label_encoder': False,
                         'eval_metric': 'logloss'
                     }
                     clf = XGBClassifier(**params, random_state=random_seed, n_jobs=-1)
@@ -479,27 +478,34 @@ class MLHelper():
     def _get_clf_eval(self, 
                       y_test: pd.Series, 
                       pred: np.ndarray, 
-                      pred_proba: np.ndarray):
+                      pred_proba: np.ndarray=None):
         confusion = confusion_matrix(y_test, pred)
         accuracy = accuracy_score(y_test , pred)
         precision = precision_score(y_test , pred)
         recall = recall_score(y_test , pred)
         f1 = f1_score(y_test, pred)
-        roc_auc = roc_auc_score(y_test, pred_proba)
         print('Confusion Matrix')
         print(confusion)
-        print('Accuracy: {0:.4f}, Precision: {1:.4f}, Recall: {2:.4f}, F1: {3:.4f}, AUC: {4:.4f}'.format(accuracy, precision, recall, f1, roc_auc))
+        if pred_proba is not None:
+            roc_auc = roc_auc_score(y_test, pred_proba)
+            print('Accuracy: {0:.4f}, Precision: {1:.4f}, Recall: {2:.4f}, F1: {3:.4f}, AUC: {4:.4f}'.format(accuracy, precision, recall, f1, roc_auc))
+        else:
+            print('Accuracy: {0:.4f}, Precision: {1:.4f}, Recall: {2:.4f}, F1: {3:.4f}'.format(accuracy, precision, recall, f1))
         
     def _get_model_train_eval(self, 
                               model,        
                               X_train: pd.DataFrame,
                               X_test: pd.DataFrame, 
                               y_train: pd.Series,
-                              y_test: pd.Series):
+                              y_test: pd.Series,
+                              should_get_pred_proba: bool=True):
         model.fit(X_train, y_train)
         pred = model.predict(X_test)
-        pred_proba=model.predict_proba(X_test)[:,1]
-        self._get_clf_eval(y_test, pred, pred_proba)
+        if should_get_pred_proba:
+            pred_proba=model.predict_proba(X_test)[:,1]
+            self._get_clf_eval(y_test, pred, pred_proba)
+        else:
+            self._get_clf_eval(y_test, pred)
         
     def _plot_learning_curve(self, 
                              model: str, 
@@ -571,11 +577,13 @@ class MLHelper():
             case 'lgbm':
                 return LGBMClassifier(**params, random_state=42, verbose=-1, n_jobs=-1)
             case 'lr':
+                if params.get('penalty') == 'l1' and not params.get('solver'):
+                    params['solver'] = 'liblinear'
                 return LogisticRegression(**params, random_state=42, n_jobs=-1)
             case 'rf':
                 return RandomForestClassifier(**params, random_state=42, n_jobs=-1)
             case 'svc':
-                return SVC(**params, random_state=42)
+                return SVC(**params, probability=True, random_state=42)
             case 'xgb':
                 return XGBClassifier(**params, random_state=42, n_jobs=-1)
             case _:
@@ -621,10 +629,24 @@ class MLHelper():
         clf = StackingClassifier(estimators=estimators, final_estimator=final, cv=5, n_jobs=-1, passthrough=passthrough)
         self._plot_learning_curve(clone(clf), X_train, y_train)
         self._get_model_train_eval(clf, X_train, X_test, y_train, y_test)
+        
+    def train_and_evaluate_stacking_ensemble_model_with_optimized_models(self, 
+                                                                         models,
+                                                                         passthrough: bool, 
+                                                                         X_train: pd.DataFrame, 
+                                                                         X_test: pd.DataFrame, 
+                                                                         y_train: pd.Series, 
+                                                                         y_test: pd.Series):
+        models_list = list(models.items())
+        estimators = [(model, self._get_model(model, params)) for model, params in models_list[:-1]]
+        final = self._get_model(models_list[-1][0], models_list[-1][1])
+        clf = StackingClassifier(estimators=estimators, final_estimator=final, cv=5, n_jobs=-1, passthrough=passthrough)
+        self._plot_learning_curve(clone(clf), X_train, y_train)
+        self._get_model_train_eval(clf, X_train, X_test, y_train, y_test)
             
     def train_and_evaluate_voting_ensemble_model(self, 
-                                                 voting: str, 
                                                  models: list[str], 
+                                                 voting: str, 
                                                  X_train: pd.DataFrame, 
                                                  X_test: pd.DataFrame, 
                                                  y_train: pd.Series, 
@@ -634,7 +656,19 @@ class MLHelper():
             return
         clf = VotingClassifier(estimators=estimators, voting=voting, n_jobs=-1)
         self._plot_learning_curve(clone(clf), X_train, y_train)
-        self._get_model_train_eval(clf, X_train, X_test, y_train, y_test)
+        self._get_model_train_eval(clf, X_train, X_test, y_train, y_test, voting=='soft')
+        
+    def train_and_evaluate_voting_ensemble_model_with_optimized_models(self, 
+                                                                       models,
+                                                                       voting: str, 
+                                                                       X_train: pd.DataFrame, 
+                                                                       X_test: pd.DataFrame, 
+                                                                       y_train: pd.Series, 
+                                                                       y_test: pd.Series):
+        estimators = [(model, self._get_model(model, params)) for model, params in models.items()]
+        clf = VotingClassifier(estimators=estimators, voting=voting, n_jobs=-1)
+        self._plot_learning_curve(clone(clf), X_train, y_train)
+        self._get_model_train_eval(clf, X_train, X_test, y_train, y_test, voting=='soft')
     
     def train_and_evaluate_bagging_ensemble_model(self, 
                                                   model: str, 
@@ -646,6 +680,18 @@ class MLHelper():
         estimator = self._get_model(model, params)
         if estimator:
             return
+        clf = BaggingClassifier(estimator=estimator, n_jobs=-1, random_state=42)
+        self._plot_learning_curve(clone(clf), X_train, y_train)
+        self._get_model_train_eval(clf, X_train, X_test, y_train, y_test)
+    
+    def train_and_evaluate_bagging_ensemble_model_with_optimized_model(self, 
+                                                                       model: str,
+                                                                       params, 
+                                                                       X_train: pd.DataFrame, 
+                                                                       X_test: pd.DataFrame, 
+                                                                       y_train: pd.Series, 
+                                                                       y_test: pd.Series):
+        estimator = self._get_model(model, params)
         clf = BaggingClassifier(estimator=estimator, n_jobs=-1, random_state=42)
         self._plot_learning_curve(clone(clf), X_train, y_train)
         self._get_model_train_eval(clf, X_train, X_test, y_train, y_test)
